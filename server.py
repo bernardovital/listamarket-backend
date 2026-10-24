@@ -650,7 +650,28 @@ async def update_product(product_id: str, body: ProductIn, user: dict = Depends(
     if clash:
         raise HTTPException(status_code=409, detail="Você já tem outro produto igual a esse")
     upd = {**f, "name_key": key, "updated_at": now_iso()}
-    await db.products.update_one({"id": product_id}, {"$set": upd})
+    await db.products.update_one({"id": product_id, "user_id": user["id"]}, {"$set": upd})
+
+    # Propaga mudanças de preço apenas para listas em andamento.
+    # Listas concluídas e o histórico de preços pagos não são modificados.
+    if f["price"] != prod.get("price"):
+        open_lists = await db.lists.find(
+            {"user_id": user["id"], "status": {"$ne": "done"}},
+            {"_id": 0, "id": 1},
+        ).to_list(50000)
+        open_ids = [lst["id"] for lst in open_lists]
+        if open_ids:
+            changed_at = now_iso()
+            await db.items.update_many(
+                {"user_id": user["id"], "product_id": product_id,
+                 "list_id": {"$in": open_ids}},
+                {"$set": {"unit_price": f["price"], "updated_at": changed_at}},
+            )
+            await db.lists.update_many(
+                {"user_id": user["id"], "id": {"$in": open_ids}},
+                {"$set": {"updated_at": changed_at}},
+            )
+
     prod.update(upd)
     return product_view(prod)
 
