@@ -133,10 +133,23 @@ class ListUpdate(BaseModel):
 
 
 class ItemIn(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
-    quantity: float = Field(default=1, gt=0, le=100000)
+    # ou `name` (item digitado) ou `product_id` (produto cadastrado)
+    name: Optional[str] = Field(default=None, max_length=200)
+    product_id: Optional[str] = None
+    quantity: Optional[float] = Field(default=None, gt=0, le=100000)
     unit: str = Field(default="un", max_length=10)
     unit_price: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+
+
+class ProductIn(BaseModel):
+    """Produto cadastrado pelo usuário. No PUT todos os campos são
+    reenviados: o que vier vazio (null) limpa o campo."""
+    name: str = Field(min_length=1, max_length=150)
+    brand: Optional[str] = Field(default=None, max_length=80)
+    quantity: Optional[float] = Field(default=None, gt=0, le=100000)
+    weight: Optional[float] = Field(default=None, gt=0, le=1_000_000)
+    weight_unit: Optional[Literal["g", "kg", "ml", "l"]] = None
+    price: Optional[float] = Field(default=None, ge=0, le=1_000_000)
 
 
 class ItemUpdate(BaseModel):
@@ -154,19 +167,52 @@ class OcrIn(BaseModel):
 
 
 # ---------------------------------------------------------------- produtos & histórico
+def fmt_num(n: float) -> str:
+    return f"{n:g}".replace(".", ",")
+
+
+def product_key(name: str, brand: Optional[str] = None,
+                weight: Optional[float] = None, weight_unit: Optional[str] = None) -> str:
+    """Identidade do produto: nome + marca + peso. 'Arroz Tio João 5 kg' e
+    'Arroz Tio João 1 kg' são produtos diferentes (preços não se comparam)."""
+    parts = [name_key(name)]
+    if brand and brand.strip():
+        parts.append(name_key(brand))
+    if weight and weight_unit:
+        parts.append(f"{weight:g}{weight_unit}")
+    return "|".join(parts)
+
+
+def product_label(p: dict) -> str:
+    parts = [p["name"]]
+    if p.get("brand"):
+        parts.append(p["brand"])
+    if p.get("weight") and p.get("weight_unit"):
+        parts.append(f"{fmt_num(p['weight'])} {p['weight_unit']}")
+    return " ".join(parts)
+
+
+def product_view(p: dict) -> dict:
+    d = {k: v for k, v in p.items() if k not in ("_id", "user_id", "name_key")}
+    d["label"] = product_label(p)
+    return d
+
+
 async def get_or_create_product(user_id: str, name: str) -> dict:
-    key = name_key(name)
+    key = product_key(name)
     prod = await db.products.find_one({"user_id": user_id, "name_key": key}, {"_id": 0})
     if prod:
         return prod
+    now = now_iso()
     prod = {
         "id": str(uuid.uuid4()),
         "user_id": user_id,
         "name": name.strip(),
         "name_key": key,
+        "brand": None, "quantity": None, "weight": None, "weight_unit": None, "price": None,
         "last_price": None, "last_store": None, "last_date": None,
         "min_price": None, "min_store": None, "min_date": None,
-        "created_at": now_iso(),
+        "created_at": now, "updated_at": now,
     }
     try:
         await db.products.insert_one(dict(prod))
@@ -466,13 +512,29 @@ async def duplicate_list(list_id: str, user: dict = Depends(get_current_user)):
 @api.post("/lists/{list_id}/items", status_code=201)
 async def add_item(list_id: str, body: ItemIn, user: dict = Depends(get_current_user)):
     await get_list_or_404(user, list_id)
-    prod = await get_or_create_product(user["id"], body.name)
+    if body.product_id:
+        prod = await db.products.find_one({"id": body.product_id, "user_id": user["id"]}, {"_id": 0})
+        if not prod:
+            raise HTTPException(status_code=404, detail="Produto não encontrado")
+        name = (body.name or "").strip() or product_label(prod)
+        quantity = body.quantity if body.quantity is not None else (prod.get("quantity") or 1)
+        if body.unit_price is not None:
+            price = body.unit_price
+        else:  # preço cadastrado no produto; senão o último que você pagou
+            price = prod["price"] if prod.get("price") is not None else prod.get("last_price")
+    else:
+        if not body.name or not body.name.strip():
+            raise HTTPException(status_code=400, detail="Informe o nome do item")
+        prod = await get_or_create_product(user["id"], body.name)
+        name = body.name.strip()
+        quantity = body.quantity if body.quantity is not None else 1
+        price = body.unit_price
     now = now_iso()
     item = {
         "id": str(uuid.uuid4()), "list_id": list_id, "user_id": user["id"],
-        "product_id": prod["id"], "name": body.name.strip(),
-        "quantity": body.quantity, "unit": body.unit.strip() or "un",
-        "unit_price": body.unit_price, "checked": False,
+        "product_id": prod["id"], "name": name,
+        "quantity": quantity, "unit": body.unit.strip() or "un",
+        "unit_price": price, "checked": False,
         "created_at": now, "updated_at": now,
     }
     await db.items.insert_one(dict(item))
@@ -485,6 +547,11 @@ async def update_item(item_id: str, body: ItemUpdate, user: dict = Depends(get_c
     item = await get_item_or_404(user, item_id)
     lst = await get_list_or_404(user, item["list_id"])
     upd: dict = {}
+    if not await db.products.find_one({"id": item["product_id"]}, {"_id": 0, "id": 1}):
+        # o produto foi apagado do catálogo: religa o item a um produto com o mesmo nome
+        relinked = await get_or_create_product(user["id"], item["name"])
+        item["product_id"] = relinked["id"]
+        upd["product_id"] = relinked["id"]
     if body.name is not None and name_key(body.name) != name_key(item["name"]):
         prod = await get_or_create_product(user["id"], body.name)
         upd["product_id"] = prod["id"]
@@ -531,28 +598,85 @@ async def delete_item(item_id: str, user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------- produtos & histórico
 @api.get("/products")
 async def search_products(q: Optional[str] = None, limit: int = 20,
+                          sort: Literal["recent", "name"] = "recent",
                           user: dict = Depends(get_current_user)):
-    """Autocomplete ao digitar o nome do item. Sem `q`, devolve os produtos
-    comprados mais recentemente."""
-    limit = max(1, min(limit, 50))
+    """Lista/busca os produtos. sort=recent (padrão, bom para autocomplete)
+    traz os comprados mais recentemente; sort=name é ordem alfabética."""
+    limit = max(1, min(limit, 200))
     query: dict = {"user_id": user["id"]}
     if q and q.strip():
         query["name_key"] = {"$regex": re.escape(name_key(q))}
-    sort = [("last_date", -1), ("created_at", -1)]
-    docs = await db.products.find(query, {"_id": 0, "user_id": 0, "name_key": 0}).sort(sort).to_list(limit)
-    return docs
+    order = [("name_key", 1)] if sort == "name" else [("last_date", -1), ("created_at", -1)]
+    docs = await db.products.find(query, {"_id": 0}).sort(order).to_list(limit)
+    return [product_view(d) for d in docs]
+
+
+def product_fields(body: ProductIn) -> dict:
+    return {
+        "name": body.name.strip(),
+        "brand": (body.brand or "").strip() or None,
+        "quantity": body.quantity,
+        "weight": body.weight,
+        "weight_unit": body.weight_unit if body.weight else None,
+        "price": body.price,
+    }
+
+
+@api.post("/products", status_code=201)
+async def create_product(body: ProductIn, user: dict = Depends(get_current_user)):
+    f = product_fields(body)
+    key = product_key(f["name"], f["brand"], f["weight"], f["weight_unit"])
+    if await db.products.find_one({"user_id": user["id"], "name_key": key}):
+        raise HTTPException(status_code=409, detail="Você já tem esse produto cadastrado")
+    now = now_iso()
+    prod = {
+        "id": str(uuid.uuid4()), "user_id": user["id"], "name_key": key, **f,
+        "last_price": None, "last_store": None, "last_date": None,
+        "min_price": None, "min_store": None, "min_date": None,
+        "created_at": now, "updated_at": now,
+    }
+    await db.products.insert_one(dict(prod))
+    return product_view(prod)
+
+
+@api.put("/products/{product_id}")
+async def update_product(product_id: str, body: ProductIn, user: dict = Depends(get_current_user)):
+    prod = await db.products.find_one({"id": product_id, "user_id": user["id"]}, {"_id": 0})
+    if not prod:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    f = product_fields(body)
+    key = product_key(f["name"], f["brand"], f["weight"], f["weight_unit"])
+    clash = await db.products.find_one({"user_id": user["id"], "name_key": key, "id": {"$ne": product_id}})
+    if clash:
+        raise HTTPException(status_code=409, detail="Você já tem outro produto igual a esse")
+    upd = {**f, "name_key": key, "updated_at": now_iso()}
+    await db.products.update_one({"id": product_id}, {"$set": upd})
+    prod.update(upd)
+    return product_view(prod)
+
+
+@api.delete("/products/{product_id}", status_code=204)
+async def delete_product(product_id: str, user: dict = Depends(get_current_user)):
+    """Apaga o produto e o histórico de preços dele. Os itens que já estão em
+    listas continuam lá (com o nome que tinham)."""
+    prod = await db.products.find_one({"id": product_id, "user_id": user["id"]}, {"_id": 0})
+    if not prod:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    await db.price_history.delete_many({"product_id": product_id, "user_id": user["id"]})
+    await db.products.delete_one({"id": product_id})
+    return None
 
 
 @api.get("/products/{product_id}/history")
 async def product_history(product_id: str, user: dict = Depends(get_current_user)):
-    prod = await db.products.find_one({"id": product_id, "user_id": user["id"]}, {"_id": 0, "user_id": 0, "name_key": 0})
+    prod = await db.products.find_one({"id": product_id, "user_id": user["id"]}, {"_id": 0})
     if not prod:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     history = await db.price_history.find(
         {"product_id": product_id, "user_id": user["id"]},
         {"_id": 0, "user_id": 0},
     ).sort("date", -1).to_list(200)
-    return {"product": prod, "history": history}
+    return {"product": product_view(prod), "history": history}
 
 
 @api.delete("/history/{entry_id}", status_code=204)
