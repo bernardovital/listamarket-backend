@@ -375,6 +375,7 @@ async def delete_account(user: dict = Depends(get_current_user)):
     await db.price_history.delete_many({"user_id": uid})
     await db.items.delete_many({"user_id": uid})
     await db.lists.delete_many({"user_id": uid})
+    await db.ad_rewards.delete_many({"user_id": uid})
     await db.products.delete_many({"user_id": uid})
     await db.users.delete_one({"id": uid})
     return None
@@ -398,8 +399,71 @@ async def get_lists(status: Optional[Literal["open", "done"]] = None,
     return [list_summary(l, by_list[l["id"]]) for l in lists]
 
 
+# Recompensas de anúncios: o servidor só reconhece registros com verified=True.
+# Nenhuma rota pública concede recompensas sem validação da plataforma de anúncios.
+# A integração com o provedor e a confirmação segura ainda serão implementadas.
+# Limites do plano gratuito (validados no servidor).
+FREE_MAX_LISTS = 1
+FREE_MAX_ITEMS = 10
+REWARD_ITEMS_PER_AD = 2
+REWARD_DURATION_HOURS = 24
+
+
+def is_premium(user: dict) -> bool:
+    return user.get("plan") == "premium"
+
+
+async def check_list_limit(user: dict) -> None:
+    if is_premium(user):
+        return
+    count = await db.lists.count_documents({"user_id": user["id"]})
+    if count >= FREE_MAX_LISTS:
+        raise HTTPException(
+            status_code=403,
+            detail="O plano Grátis permite apenas 1 lista. Exclua a lista atual ou assine o Premium para criar listas ilimitadas.",
+        )
+
+
+async def item_allowance(user: dict, list_id: str) -> dict:
+    """Apenas recompensas verificadas e ainda válidas ampliam o limite."""
+    if is_premium(user):
+        return {"plan": "premium", "base_limit": None, "bonus_items": None, "item_limit": None}
+    active = await db.ad_rewards.count_documents({
+        "user_id": user["id"], "list_id": list_id,
+        "expires_at": {"$gt": datetime.now(timezone.utc)},
+        "verified": True,
+    })
+    bonus = active * REWARD_ITEMS_PER_AD
+    return {"plan": "gratis", "base_limit": FREE_MAX_ITEMS,
+            "bonus_items": bonus, "item_limit": FREE_MAX_ITEMS + bonus}
+
+
+@api.get("/lists/{list_id}/item-allowance")
+async def get_item_allowance(list_id: str, user: dict = Depends(get_current_user)):
+    await get_list_or_404(user, list_id)
+    allowance = await item_allowance(user, list_id)
+    allowance["item_count"] = await db.items.count_documents({
+        "user_id": user["id"], "list_id": list_id})
+    allowance["reward_items_per_ad"] = REWARD_ITEMS_PER_AD
+    allowance["reward_duration_hours"] = REWARD_DURATION_HOURS
+    return allowance
+
+
+async def check_item_limit(user: dict, list_id: str) -> None:
+    if is_premium(user):
+        return
+    count = await db.items.count_documents({"user_id": user["id"], "list_id": list_id})
+    allowance = await item_allowance(user, list_id)
+    if count >= allowance["item_limit"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Limite de produtos atingido. Assista a um anúncio recompensado para liberar mais 2 produtos por 24 horas, exclua um item ou assine o Premium.",
+        )
+
+
 @api.post("/lists", status_code=201)
 async def create_list(body: ListIn, user: dict = Depends(get_current_user)):
+    await check_list_limit(user)
     now = now_iso()
     doc = {
         "id": str(uuid.uuid4()), "user_id": user["id"], "name": body.name.strip(),
@@ -449,6 +513,7 @@ async def delete_list(list_id: str, user: dict = Depends(get_current_user)):
     await get_list_or_404(user, list_id)
     await db.items.delete_many({"list_id": list_id})
     await db.lists.delete_one({"id": list_id})
+    await db.ad_rewards.delete_many({"user_id": user["id"], "list_id": list_id})
     return None
 
 
@@ -480,6 +545,7 @@ async def duplicate_list(list_id: str, user: dict = Depends(get_current_user)):
     """Nova lista com os mesmos itens, já com o ÚLTIMO PREÇO pago em cada um.
     É o atalho da "próxima ida ao mercado"."""
     src = await get_list_or_404(user, list_id)
+    await check_list_limit(user)
     src_items = await db.items.find({"list_id": list_id}, {"_id": 0}).sort("created_at", 1).to_list(5000)
     pids = list({i["product_id"] for i in src_items})
     prods = {}
@@ -512,6 +578,7 @@ async def duplicate_list(list_id: str, user: dict = Depends(get_current_user)):
 @api.post("/lists/{list_id}/items", status_code=201)
 async def add_item(list_id: str, body: ItemIn, user: dict = Depends(get_current_user)):
     await get_list_or_404(user, list_id)
+    await check_item_limit(user, list_id)
     if body.product_id:
         prod = await db.products.find_one({"id": body.product_id, "user_id": user["id"]}, {"_id": 0})
         if not prod:
@@ -828,6 +895,7 @@ async def on_startup():
     await db.lists.create_index([("user_id", 1), ("updated_at", -1)])
     await db.items.create_index("list_id")
     await db.items.create_index("user_id")
+    await db.ad_rewards.create_index([("user_id", 1), ("list_id", 1), ("expires_at", 1)])
     await db.products.create_index([("user_id", 1), ("name_key", 1)], unique=True)
     await db.price_history.create_index([("product_id", 1), ("date", -1)])
     await db.price_history.create_index("item_id")
