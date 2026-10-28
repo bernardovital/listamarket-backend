@@ -1,10 +1,12 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
+from fastapi.concurrency import run_in_threadpool
 import os
 import re
 import json
@@ -17,6 +19,13 @@ from datetime import datetime, timezone, timedelta
 
 import jwt
 import requests
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives import hashes
+from urllib.parse import parse_qsl
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import load_der_public_key
+import base64
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, EmailStr, field_validator
 
@@ -375,6 +384,7 @@ async def delete_account(user: dict = Depends(get_current_user)):
     await db.price_history.delete_many({"user_id": uid})
     await db.items.delete_many({"user_id": uid})
     await db.lists.delete_many({"user_id": uid})
+    await db.ad_rewards.delete_many({"user_id": uid})
     await db.products.delete_many({"user_id": uid})
     await db.users.delete_one({"id": uid})
     return None
@@ -398,8 +408,103 @@ async def get_lists(status: Optional[Literal["open", "done"]] = None,
     return [list_summary(l, by_list[l["id"]]) for l in lists]
 
 
+# Recompensas de anúncios: o servidor só reconhece registros com verified=True.
+# Nenhuma rota pública concede recompensas sem validação da plataforma de anúncios.
+# A integração com o provedor e a confirmação segura ainda serão implementadas.
+# Limites do plano gratuito (validados no servidor).
+FREE_MAX_LISTS = 1
+FREE_MAX_ITEMS = 10
+REWARD_ITEMS_PER_AD = 2
+REWARD_DURATION_HOURS = 24
+ADMOB_REWARDED_AD_UNIT_ID = "ca-app-pub-4150349574154625/6264835990"
+ADMOB_SSV_KEYS_URL = "https://www.gstatic.com/admob/reward/verifier-keys.json"
+
+def fetch_admob_public_keys():
+    response = requests.get(ADMOB_SSV_KEYS_URL, timeout=10)
+    response.raise_for_status()
+    return response.json()["keys"]
+
+def load_admob_public_key(key_data):
+    key_bytes = base64.b64decode(key_data["base64"])
+    return load_der_public_key(key_bytes)
+
+def find_admob_public_key(keys, key_id):
+    for key_data in keys:
+        if str(key_data.get("keyId")) == str(key_id):
+            return load_admob_public_key(key_data)
+    raise ValueError("Chave pública do AdMob não encontrada")
+def decode_admob_signature(signature):
+    padding = "=" * (-len(signature) % 4)
+    signature_bytes = base64.urlsafe_b64decode(signature + padding)
+
+    if not signature_bytes:
+        raise ValueError("Assinatura do AdMob inválida")
+
+    return signature_bytes
+
+def verify_admob_signature(signed_content, signature, public_key):
+    decoded_signature = decode_admob_signature(signature)
+    public_key.verify(
+        decoded_signature,
+        signed_content.encode("utf-8"),
+        ec.ECDSA(hashes.SHA256()),
+    )
+
+def is_premium(user: dict) -> bool:
+    return user.get("plan") == "premium"
+
+
+async def check_list_limit(user: dict) -> None:
+    if is_premium(user):
+        return
+    count = await db.lists.count_documents({"user_id": user["id"]})
+    if count >= FREE_MAX_LISTS:
+        raise HTTPException(
+            status_code=403,
+            detail="O plano Grátis permite apenas 1 lista. Exclua a lista atual ou assine o Premium para criar listas ilimitadas.",
+        )
+
+
+async def item_allowance(user: dict, list_id: str) -> dict:
+    """Apenas recompensas verificadas e ainda válidas ampliam o limite."""
+    if is_premium(user):
+        return {"plan": "premium", "base_limit": None, "bonus_items": None, "item_limit": None}
+    active = await db.ad_rewards.count_documents({
+        "user_id": user["id"], "list_id": list_id,
+        "expires_at": {"$gt": datetime.now(timezone.utc)},
+        "verified": True,
+    })
+    bonus = active * REWARD_ITEMS_PER_AD
+    return {"plan": "gratis", "base_limit": FREE_MAX_ITEMS,
+            "bonus_items": bonus, "item_limit": FREE_MAX_ITEMS + bonus}
+
+
+@api.get("/lists/{list_id}/item-allowance")
+async def get_item_allowance(list_id: str, user: dict = Depends(get_current_user)):
+    await get_list_or_404(user, list_id)
+    allowance = await item_allowance(user, list_id)
+    allowance["item_count"] = await db.items.count_documents({
+        "user_id": user["id"], "list_id": list_id})
+    allowance["reward_items_per_ad"] = REWARD_ITEMS_PER_AD
+    allowance["reward_duration_hours"] = REWARD_DURATION_HOURS
+    return allowance
+
+
+async def check_item_limit(user: dict, list_id: str) -> None:
+    if is_premium(user):
+        return
+    count = await db.items.count_documents({"user_id": user["id"], "list_id": list_id})
+    allowance = await item_allowance(user, list_id)
+    if count >= allowance["item_limit"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Limite de produtos atingido. Assista a um anúncio recompensado para liberar mais 2 produtos por 24 horas, exclua um item ou assine o Premium.",
+        )
+
+
 @api.post("/lists", status_code=201)
 async def create_list(body: ListIn, user: dict = Depends(get_current_user)):
+    await check_list_limit(user)
     now = now_iso()
     doc = {
         "id": str(uuid.uuid4()), "user_id": user["id"], "name": body.name.strip(),
@@ -449,6 +554,7 @@ async def delete_list(list_id: str, user: dict = Depends(get_current_user)):
     await get_list_or_404(user, list_id)
     await db.items.delete_many({"list_id": list_id})
     await db.lists.delete_one({"id": list_id})
+    await db.ad_rewards.delete_many({"user_id": user["id"], "list_id": list_id})
     return None
 
 
@@ -480,6 +586,7 @@ async def duplicate_list(list_id: str, user: dict = Depends(get_current_user)):
     """Nova lista com os mesmos itens, já com o ÚLTIMO PREÇO pago em cada um.
     É o atalho da "próxima ida ao mercado"."""
     src = await get_list_or_404(user, list_id)
+    await check_list_limit(user)
     src_items = await db.items.find({"list_id": list_id}, {"_id": 0}).sort("created_at", 1).to_list(5000)
     pids = list({i["product_id"] for i in src_items})
     prods = {}
@@ -512,6 +619,7 @@ async def duplicate_list(list_id: str, user: dict = Depends(get_current_user)):
 @api.post("/lists/{list_id}/items", status_code=201)
 async def add_item(list_id: str, body: ItemIn, user: dict = Depends(get_current_user)):
     await get_list_or_404(user, list_id)
+    await check_item_limit(user, list_id)
     if body.product_id:
         prod = await db.products.find_one({"id": body.product_id, "user_id": user["id"]}, {"_id": 0})
         if not prod:
@@ -805,7 +913,127 @@ async def ocr_price(body: OcrIn, user: dict = Depends(get_current_user)):
     result["remaining"] = max(quota["limit"] - used, 0)
     return result
 
+@api.get("/admob/ssv")
+async def admob_ssv(request: Request):
+    raw_query = request.scope["query_string"].decode("ascii")
+    if not raw_query:
+        raise HTTPException(status_code=400, detail="Callback vazio")
 
+
+    param_pairs = parse_qsl(raw_query, keep_blank_values=True)
+    param_names = [name for name, value in param_pairs]
+
+    if len(param_names) != len(set(param_names)):
+        raise HTTPException(
+            status_code=400,
+            detail="Parâmetros duplicados no callback"
+        )
+
+    params = dict(param_pairs)
+    key_id = params.get("key_id")
+    if not key_id:
+        raise HTTPException(status_code=400, detail="ID da chave ausente")
+
+    signature = params.get("signature")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Assinatura ausente")
+
+    signed_content = raw_query.split("&signature=", 1)[0]
+    if signed_content == raw_query or "&key_id=" not in raw_query:
+        raise HTTPException(status_code=400, detail="Formato do callback inválido")
+
+    keys = await run_in_threadpool(fetch_admob_public_keys)
+    public_key = find_admob_public_key(keys, key_id)
+    try:
+        verify_admob_signature(signed_content, signature, public_key)
+    except (InvalidSignature, ValueError):
+        raise HTTPException(
+            status_code=403,
+            detail="Assinatura do AdMob inválida"
+        )
+    if params.get("ad_unit") != ADMOB_REWARDED_AD_UNIT_ID:
+        raise HTTPException(
+            status_code=403,
+            detail="Unidade de anúncio inválida"
+        )
+    if params.get("reward_amount") != str(REWARD_ITEMS_PER_AD):
+        raise HTTPException(
+            status_code=403,
+            detail="Quantidade da recompensa inválida"
+        )
+    if params.get("reward_item") != "produtos_extras":
+        raise HTTPException(
+            status_code=403,
+            detail="Tipo de recompensa inválido"
+        )
+    timestamp = params.get("timestamp")
+    try:
+        ad_time = datetime.fromtimestamp(
+            int(timestamp) / 1000,
+            tz=timezone.utc
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(
+            status_code=400,
+            detail="Data do anúncio inválida"
+        )
+
+    now = datetime.now(timezone.utc)
+    if ad_time > now + timedelta(minutes=5) or ad_time < now - timedelta(hours=24):
+        raise HTTPException(
+            status_code=403,
+            detail="Anúncio fora do prazo permitido"
+        )
+    transaction_id = params.get("transaction_id")
+    if not transaction_id:
+        raise HTTPException(
+            status_code=400,
+            detail="ID da transação ausente"
+        )
+    existing_reward = await db.ad_rewards.find_one(
+        {"transaction_id": transaction_id}
+   )
+    if existing_reward:
+        return {"status": "already_processed"}
+
+    admob_user_id = params.get("user_id")
+    if not admob_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Usuário do anúncio não informado"
+        )
+    list_id = params.get("custom_data")
+    if not list_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Lista do anúncio não informada"
+        )
+    reward_list = await db.lists.find_one({
+        "id": list_id,
+        "user_id": admob_user_id
+    })
+
+    if not reward_list:
+        raise HTTPException(
+            status_code=403,
+            detail="Lista não pertence ao usuário"
+        )
+    rewarded_at = datetime.now(timezone.utc)
+    expires_at = rewarded_at + timedelta(hours=REWARD_DURATION_HOURS)
+    reward_record = {
+        "transaction_id": transaction_id,
+        "user_id": admob_user_id,
+        "list_id": list_id,
+        "reward_amount": REWARD_ITEMS_PER_AD,
+        "verified": True,
+        "created_at": rewarded_at,
+        "expires_at": expires_at
+    }
+    try:
+        await db.ad_rewards.insert_one(reward_record)
+    except DuplicateKeyError:
+        return {"status": "already_processed"}
+    return {"status": "verified"}
 @api.get("/health")
 async def health():
     return {"ok": True}
@@ -828,6 +1056,8 @@ async def on_startup():
     await db.lists.create_index([("user_id", 1), ("updated_at", -1)])
     await db.items.create_index("list_id")
     await db.items.create_index("user_id")
+    await db.ad_rewards.create_index([("user_id", 1), ("list_id", 1), ("expires_at", 1)])
+    await db.ad_rewards.create_index("transaction_id", unique=True, sparse=True)
     await db.products.create_index([("user_id", 1), ("name_key", 1)], unique=True)
     await db.price_history.create_index([("product_id", 1), ("date", -1)])
     await db.price_history.create_index("item_id")
