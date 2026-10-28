@@ -947,6 +947,7 @@ async def admob_ssv(request: Request):
     try:
         verify_admob_signature(signed_content, signature, public_key)
     except (InvalidSignature, ValueError):
+        print("ADMOB SSV: assinatura rejeitada", flush=True)
         raise HTTPException(
             status_code=403,
             detail="Assinatura do AdMob inválida"
