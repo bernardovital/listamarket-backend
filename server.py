@@ -954,7 +954,7 @@ async def admob_ssv(request: Request):
             detail="Assinatura do AdMob inválida"
         )
     print("ADMOB SSV: assinatura passou; verificando teste", flush=True)
-    if params.get("ad_unit") == "1234567890" and params.get("transaction_id") == "1234567898":
+    if params.get("ad_unit") == "1234567890" and params.get("transaction_id") == "1234567890":
         return {"status": "test_verified"}
     if params.get("ad_unit") != ADMOB_REWARDED_AD_UNIT_ID:
         raise HTTPException(
