@@ -915,6 +915,7 @@ async def ocr_price(body: OcrIn, user: dict = Depends(get_current_user)):
 
 @api.get("/admob/ssv")
 async def admob_ssv(request: Request):
+    print("ADMOB SSV: callback recebido", flush=True)
     raw_query = request.scope["query_string"].decode("ascii")
     if not raw_query:
         raise HTTPException(status_code=400, detail="Callback vazio")
