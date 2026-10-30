@@ -956,7 +956,7 @@ async def admob_ssv(request: Request):
     print("ADMOB SSV: assinatura passou; verificando teste", flush=True)
     if params.get("ad_unit") == "1234567890":
         return {"status": "test_verified"}
-    if params.get("ad_unit") != ADMOB_REWARDED_AD_UNIT_ID:
+    if params.get("ad_unit") != ADMOB_REWARDED_AD_UNIT_ID.split("/")[-1]:
         raise HTTPException(
             status_code=403,
             detail="Unidade de anúncio inválida"
