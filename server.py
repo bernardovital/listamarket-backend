@@ -26,6 +26,7 @@ from urllib.parse import parse_qsl
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.serialization import load_der_public_key
 import base64
+import hashlib
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, EmailStr, field_validator
 
@@ -102,7 +103,7 @@ def current_month() -> str:
 
 def ocr_quota(user: dict) -> dict:
     used = user.get("ocr_count", 0) if user.get("ocr_month") == current_month() else 0
-    limit = OCR_PREMIUM_MONTHLY if user.get("plan") == "premium" else OCR_FREE_MONTHLY
+    limit = OCR_PREMIUM_MONTHLY if is_premium(user) else OCR_FREE_MONTHLY
     return {"used": used, "limit": limit, "remaining": max(limit - used, 0)}
 
 
@@ -129,6 +130,10 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
+
+class PremiumRedeemIn(BaseModel):
+    code: str = Field(min_length=8, max_length=100)
 
 
 class ListIn(BaseModel):
@@ -345,7 +350,8 @@ async def touch_list(list_id: str) -> None:
 def user_out(user: dict) -> dict:
     return {
         "id": user["id"], "email": user["email"], "name": user["name"],
-        "plan": user.get("plan", "gratis"),
+        "plan": "premium" if is_premium(user) else "gratis",
+        "premium_expires_at": user.get("premium_expires_at") if is_premium(user) else None,
         "ocr": ocr_quota(user),
     }
 
@@ -385,6 +391,7 @@ async def delete_account(user: dict = Depends(get_current_user)):
     await db.items.delete_many({"user_id": uid})
     await db.lists.delete_many({"user_id": uid})
     await db.ad_rewards.delete_many({"user_id": uid})
+    await db.premium_codes.update_many({"redeemed_by": uid}, {"$unset": {"redeemed_by": ""}})
     await db.products.delete_many({"user_id": uid})
     await db.users.delete_one({"id": uid})
     return None
@@ -451,7 +458,62 @@ def verify_admob_signature(signed_content, signature, public_key):
     )
 
 def is_premium(user: dict) -> bool:
-    return user.get("plan") == "premium"
+    if user.get("plan") != "premium":
+        return False
+    expires = user.get("premium_expires_at")
+    if not expires:
+        # Compatibilidade com contas Premium antigas sem vencimento.
+        return True
+    try:
+        expires_dt = datetime.fromisoformat(expires) if isinstance(expires, str) else expires
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+        return expires_dt > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
+@api.post("/premium/redeem")
+async def redeem_premium(body: PremiumRedeemIn, user: dict = Depends(get_current_user)):
+    """Ativa uma chave uma única vez, sem expor chaves em texto puro no banco."""
+    code = body.code.strip().upper()
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    from pymongo import ReturnDocument
+
+    # Reserva atômica: chamadas simultâneas não conseguem gastar a mesma chave.
+    redeemed = await db.premium_codes.find_one_and_update(
+        {"code_hash": code_hash, "redeemed_at": None},
+        {"$set": {"redeemed_at": now, "redeemed_by": user["id"]}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not redeemed:
+        raise HTTPException(status_code=400, detail="Chave inválida ou já utilizada")
+
+    try:
+        # Uma segunda chave acrescenta 30 dias ao prazo ainda vigente.
+        current_expiry = user.get("premium_expires_at")
+        if current_expiry and is_premium(user):
+            current_expiry = datetime.fromisoformat(current_expiry) if isinstance(current_expiry, str) else current_expiry
+            if current_expiry.tzinfo is None:
+                current_expiry = current_expiry.replace(tzinfo=timezone.utc)
+            start = max(now, current_expiry)
+        else:
+            start = now
+        expiry = (start + timedelta(days=30)).isoformat()
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"plan": "premium", "premium_expires_at": expiry}},
+        )
+    except Exception:
+        # Em falhas ao ativar a conta, devolve a chave à condição não usada.
+        await db.premium_codes.update_one(
+            {"code_hash": code_hash, "redeemed_by": user["id"], "redeemed_at": now},
+            {"$set": {"redeemed_at": None}, "$unset": {"redeemed_by": ""}},
+        )
+        raise
+    updated_user = {**user, "plan": "premium", "premium_expires_at": expiry}
+    return {"message": "Premium ativado por 30 dias", "user": user_out(updated_user)}
 
 
 async def check_list_limit(user: dict) -> None:
@@ -1058,6 +1120,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     await db.users.create_index("email", unique=True)
+    await db.premium_codes.create_index("code_hash", unique=True)
     await db.lists.create_index([("user_id", 1), ("updated_at", -1)])
     await db.items.create_index("list_id")
     await db.items.create_index("user_id")
